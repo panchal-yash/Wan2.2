@@ -23,7 +23,7 @@ easydict==1.13
 einops==0.8.1
 ffmpeg==1.4
 filelock==3.20.0
-flash_attn @ file://./flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 flatbuffers==25.9.23
 fonttools==4.60.1
 frozenlist==1.8.0
