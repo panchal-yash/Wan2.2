@@ -3,7 +3,16 @@
 Test Client for Wan S2V Flask API Server
 
 This script simulates a backend server making requests to the GPU server.
-It demonstrates the complete workflow from request submission to result retrieval.
+It demonstrates the complete workflow from request submission to result retrieval
+using the new {user_id}/{video_id}/{segment_id} structure.
+
+The new API expects the following files to be pre-uploaded to R2:
+- {bucket_name}/{user_id}/{video_id}/{segment_id}/image.jpg
+- {bucket_name}/{user_id}/{video_id}/{segment_id}/audio.wav  
+- {bucket_name}/{user_id}/{video_id}/{segment_id}/prompt.txt
+
+The result will be uploaded to:
+- {bucket_name}/{user_id}/{video_id}/{segment_id}/output.mp4
 """
 
 import requests
@@ -34,21 +43,18 @@ class WanAPIClient:
         except Exception as e:
             return {'error': f'Unexpected error: {str(e)}'}
     
-    def submit_request(self, user_id: str, request_id: str, 
-                      prompt: str, image_r2_path: str, audio_r2_path: str,
-                      **kwargs) -> Dict[str, Any]:
+    def submit_request(self, user_id: str, video_id: str, segment_id: str, 
+                      bucket_name: str = "dolphintest", **kwargs) -> Dict[str, Any]:
         """Submit a new processing request"""
         
         payload = {
-            'prompt': prompt,
-            'image_r2_path': image_r2_path,
-            'audio_r2_path': audio_r2_path,
+            'bucket_name': bucket_name,
             **kwargs  # Additional parameters like size, sample_guide_scale, etc.
         }
         
         try:
             response = self.session.post(
-                f"{self.base_url}/{user_id}/{request_id}",
+                f"{self.base_url}/{user_id}/{video_id}/{segment_id}",
                 json=payload,
                 timeout=self.timeout,
                 headers={'Content-Type': 'application/json'}
@@ -67,11 +73,11 @@ class WanAPIClient:
         except Exception as e:
             return {'error': f'Unexpected error: {str(e)}'}
     
-    def get_status(self, user_id: str, request_id: str) -> Dict[str, Any]:
+    def get_status(self, user_id: str, video_id: str, segment_id: str) -> Dict[str, Any]:
         """Get request status"""
         try:
             response = self.session.get(
-                f"{self.base_url}/{user_id}/{request_id}/status",
+                f"{self.base_url}/{user_id}/{video_id}/{segment_id}/status",
                 timeout=self.timeout
             )
             
@@ -88,11 +94,11 @@ class WanAPIClient:
         except Exception as e:
             return {'error': f'Unexpected error: {str(e)}'}
     
-    def get_result(self, user_id: str, request_id: str) -> Dict[str, Any]:
+    def get_result(self, user_id: str, video_id: str, segment_id: str) -> Dict[str, Any]:
         """Get request result"""
         try:
             response = self.session.get(
-                f"{self.base_url}/{user_id}/{request_id}/result",
+                f"{self.base_url}/{user_id}/{video_id}/{segment_id}/result",
                 timeout=self.timeout
             )
             
@@ -130,15 +136,15 @@ class WanAPIClient:
             return {'error': f'List requests failed: {str(e)}'}
 
 
-def poll_until_complete(client: WanAPIClient, user_id: str, request_id: str, 
+def poll_until_complete(client: WanAPIClient, user_id: str, video_id: str, segment_id: str, 
                        poll_interval: int = 10, max_wait: int = 3600) -> Dict[str, Any]:
     """Poll request status until completion or timeout"""
     
-    print(f"Polling status for {user_id}/{request_id}...")
+    print(f"Polling status for {user_id}/{video_id}/{segment_id}...")
     start_time = time.time()
     
     while time.time() - start_time < max_wait:
-        status = client.get_status(user_id, request_id)
+        status = client.get_status(user_id, video_id, segment_id)
         
         if 'error' in status:
             return status
@@ -173,16 +179,16 @@ def run_test_scenario(client: WanAPIClient, scenario: Dict[str, Any]) -> bool:
     print(f"{'='*60}")
     
     user_id = scenario['user_id']
-    request_id = scenario['request_id']
+    video_id = scenario['video_id']
+    segment_id = scenario['segment_id']
     
     # Submit request
-    print(f"Submitting request {user_id}/{request_id}...")
+    print(f"Submitting request {user_id}/{video_id}/{segment_id}...")
     submit_result = client.submit_request(
         user_id=user_id,
-        request_id=request_id,
-        prompt=scenario['prompt'],
-        image_r2_path=scenario['image_r2_path'],
-        audio_r2_path=scenario['audio_r2_path'],
+        video_id=video_id,
+        segment_id=segment_id,
+        bucket_name=scenario.get('bucket_name', 'dolphintest'),
         **scenario.get('params', {})
     )
     
@@ -196,7 +202,7 @@ def run_test_scenario(client: WanAPIClient, scenario: Dict[str, Any]) -> bool:
     
     # Poll until completion
     final_status = poll_until_complete(
-        client, user_id, request_id, 
+        client, user_id, video_id, segment_id, 
         poll_interval=scenario.get('poll_interval', 10),
         max_wait=scenario.get('max_wait', 3600)
     )
@@ -210,7 +216,7 @@ def run_test_scenario(client: WanAPIClient, scenario: Dict[str, Any]) -> bool:
         print(f"✅ Request completed successfully!")
         
         # Get result details
-        result = client.get_result(user_id, request_id)
+        result = client.get_result(user_id, video_id, segment_id)
         if 'error' not in result:
             print(f"   R2 Output: {result.get('r2_output_path', 'unknown')}")
             if result.get('public_url'):
@@ -285,10 +291,9 @@ def main():
         {
             'name': 'Basic S2V Test',
             'user_id': 'test_user_001',
-            'request_id': f'req_{int(time.time())}',
-            'prompt': 'A beautiful sunset over the ocean with gentle waves',
-            'image_r2_path': 'input-bucket/images/test/sunset.jpg',
-            'audio_r2_path': 'input-bucket/audio/test/ocean_waves.wav',
+            'video_id': 'video_001',
+            'segment_id': f'segment_{int(time.time())}',
+            'bucket_name': 'dolphintest',
             'params': {
                 'size': '832*480',
                 'sample_guide_scale': 4.0,

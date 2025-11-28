@@ -37,14 +37,12 @@ class RequestStatus(Enum):
 class ProcessingRequest:
     """Data class for processing requests"""
     user_id: str
-    request_id: str
-    prompt: str
-    image_r2_path: str
-    audio_r2_path: str
+    video_id: str
+    segment_id: str
+    bucket_name: str = "dolphintest"
     size: str = "832*480"
     sample_guide_scale: float = 4.0
     sample_steps: int = 20
-    output_bucket: Optional[str] = None
     ckpt_dir: str = "./Wan2.2-S2V-14B/"
     
     # Processing metadata
@@ -57,9 +55,34 @@ class ProcessingRequest:
     end_time: Optional[str] = None
     local_workspace: Optional[str] = None
     local_output_file: Optional[str] = None
-    r2_output_path: Optional[str] = None
+    r2_base_path: Optional[str] = None
     public_url: Optional[str] = None
     error_details: Optional[str] = None
+    
+    @property
+    def segment_path(self) -> str:
+        """Get the R2 path for this segment"""
+        return f"{self.user_id}/{self.video_id}/{self.segment_id}"
+    
+    @property 
+    def r2_image_path(self) -> str:
+        """Get the R2 path for the input image"""
+        return f"{self.bucket_name}/{self.segment_path}/image.jpg"
+    
+    @property
+    def r2_audio_path(self) -> str:
+        """Get the R2 path for the input audio"""
+        return f"{self.bucket_name}/{self.segment_path}/audio.wav"
+    
+    @property
+    def r2_prompt_path(self) -> str:
+        """Get the R2 path for the prompt file"""
+        return f"{self.bucket_name}/{self.segment_path}/prompt.txt"
+    
+    @property
+    def r2_output_path(self) -> str:
+        """Get the R2 path for the output video"""
+        return f"{self.bucket_name}/{self.segment_path}/output.mp4"
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -77,9 +100,9 @@ class WorkspaceManager:
         self.base_workspace_dir = Path(base_workspace_dir)
         self.base_workspace_dir.mkdir(exist_ok=True)
         
-    def create_workspace(self, user_id: str, request_id: str) -> str:
+    def create_workspace(self, user_id: str, video_id: str, segment_id: str) -> str:
         """Create workspace directory for a request"""
-        workspace_path = self.base_workspace_dir / user_id / request_id
+        workspace_path = self.base_workspace_dir / user_id / video_id / segment_id
         workspace_path.mkdir(parents=True, exist_ok=True)
         
         logger.info(f"Created workspace: {workspace_path}")
@@ -103,6 +126,7 @@ class WorkspaceManager:
         return {
             'image': str(workspace / "image.jpg"),
             'audio': str(workspace / "audio.wav"),
+            'prompt': str(workspace / "prompt.txt"),
             'output': str(workspace / "output.mp4")
         }
 
@@ -112,11 +136,9 @@ class SequentialQueueManager:
     
     def __init__(self, r2_client: Any, 
                  workspace_manager: WorkspaceManager,
-                 output_bucket: str = "output-bucket",
                  cleanup_after_processing: bool = True):
         self.r2_client = r2_client
         self.workspace_manager = workspace_manager
-        self.output_bucket = output_bucket
         self.cleanup_after_processing = cleanup_after_processing
         
         # Queue management
@@ -153,7 +175,7 @@ class SequentialQueueManager:
     
     def add_request(self, request: ProcessingRequest) -> bool:
         """Add a new request to the processing queue"""
-        request_key = f"{request.user_id}_{request.request_id}"
+        request_key = f"{request.user_id}_{request.video_id}_{request.segment_id}"
         
         with self.status_lock:
             if request_key in self.request_status:
@@ -174,9 +196,9 @@ class SequentialQueueManager:
         logger.info(f"Added request {request_key} to queue (position: {request.queue_position})")
         return True
     
-    def get_request_status(self, user_id: str, request_id: str) -> Optional[ProcessingRequest]:
+    def get_request_status(self, user_id: str, video_id: str, segment_id: str) -> Optional[ProcessingRequest]:
         """Get status of a specific request"""
-        request_key = f"{user_id}_{request_id}"
+        request_key = f"{user_id}_{video_id}_{segment_id}"
         with self.status_lock:
             return self.request_status.get(request_key)
     
@@ -192,7 +214,8 @@ class SequentialQueueManager:
                 if req.status == RequestStatus.QUEUED:
                     queued_requests.append({
                         'user_id': req.user_id,
-                        'request_id': req.request_id,
+                        'video_id': req.video_id,
+                        'segment_id': req.segment_id,
                         'queue_position': req.queue_position,
                         'created_time': req.created_time
                     })
@@ -235,7 +258,7 @@ class SequentialQueueManager:
     
     def _process_single_request(self, request: ProcessingRequest):
         """Process a single request through the complete pipeline"""
-        request_key = f"{request.user_id}_{request.request_id}"
+        request_key = f"{request.user_id}_{request.video_id}_{request.segment_id}"
         
         try:
             with self.status_lock:
@@ -275,13 +298,13 @@ class SequentialQueueManager:
                 self.current_processing = None
     
     def _download_assets(self, request: ProcessingRequest) -> bool:
-        """Download image and audio assets from R2"""
+        """Download image, audio, and prompt assets from R2"""
         self._update_status(request, RequestStatus.DOWNLOADING, "Downloading assets from R2...", 10)
         
         try:
             # Create workspace
             request.local_workspace = self.workspace_manager.create_workspace(
-                request.user_id, request.request_id
+                request.user_id, request.video_id, request.segment_id
             )
             
             # Get local file paths
@@ -289,17 +312,23 @@ class SequentialQueueManager:
             
             # Download image
             self._update_status(request, RequestStatus.DOWNLOADING, "Downloading image...", 15)
-            if not self.r2_client.download_file(request.image_r2_path, local_paths['image']):
-                request.error_details = f"Failed to download image: {request.image_r2_path}"
+            if not self.r2_client.download_file(request.r2_image_path, local_paths['image']):
+                request.error_details = f"Failed to download image: {request.r2_image_path}"
                 return False
             
             # Download audio
-            self._update_status(request, RequestStatus.DOWNLOADING, "Downloading audio...", 25)
-            if not self.r2_client.download_file(request.audio_r2_path, local_paths['audio']):
-                request.error_details = f"Failed to download audio: {request.audio_r2_path}"
+            self._update_status(request, RequestStatus.DOWNLOADING, "Downloading audio...", 20)
+            if not self.r2_client.download_file(request.r2_audio_path, local_paths['audio']):
+                request.error_details = f"Failed to download audio: {request.r2_audio_path}"
                 return False
             
-            logger.info(f"Successfully downloaded assets for {request.user_id}/{request.request_id}")
+            # Download prompt
+            self._update_status(request, RequestStatus.DOWNLOADING, "Downloading prompt...", 25)
+            if not self.r2_client.download_file(request.r2_prompt_path, local_paths['prompt']):
+                request.error_details = f"Failed to download prompt: {request.r2_prompt_path}"
+                return False
+            
+            logger.info(f"Successfully downloaded assets for {request.user_id}/{request.video_id}/{request.segment_id}")
             return True
             
         except Exception as e:
@@ -319,6 +348,15 @@ class SequentialQueueManager:
                 
             local_paths = self.workspace_manager.get_local_paths(request.local_workspace)
             
+            # Read prompt from file
+            prompt_text = ""
+            try:
+                with open(local_paths['prompt'], 'r', encoding='utf-8') as f:
+                    prompt_text = f.read().strip()
+            except Exception as e:
+                request.error_details = f"Failed to read prompt file: {str(e)}"
+                return False
+            
             # Build command arguments
             cmd = [
                 "python", "generate.py",
@@ -327,7 +365,7 @@ class SequentialQueueManager:
                 "--ckpt_dir", request.ckpt_dir,
                 "--offload_model", "False",
                 "--convert_model_dtype",
-                "--prompt", request.prompt,
+                "--prompt", prompt_text,
                 "--image", local_paths['image'],
                 "--audio", local_paths['audio'],
                 "--sample_guide_scale", str(request.sample_guide_scale),
@@ -335,7 +373,7 @@ class SequentialQueueManager:
                 "--save_file", local_paths['output']
             ]
             
-            logger.info(f"Executing generation command for {request.user_id}/{request.request_id}")
+            logger.info(f"Executing generation command for {request.user_id}/{request.video_id}/{request.segment_id}")
             logger.debug(f"Command: {' '.join(cmd)}")
             
             # Execute the command
@@ -363,7 +401,7 @@ class SequentialQueueManager:
             request.local_output_file = local_paths['output']
             self._update_status(request, RequestStatus.PROCESSING, "Video generation completed", 80)
             
-            logger.info(f"Successfully generated video for {request.user_id}/{request.request_id}")
+            logger.info(f"Successfully generated video for {request.user_id}/{request.video_id}/{request.segment_id}")
             return True
             
         except subprocess.TimeoutExpired:
@@ -384,12 +422,7 @@ class SequentialQueueManager:
                 request.error_details = "No local output file to upload"
                 return False
             
-            # Generate R2 output path
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_bucket = request.output_bucket or self.output_bucket
-            request.r2_output_path = f"{output_bucket}/videos/{request.user_id}/{request.request_id}_{timestamp}.mp4"
-            
-            # Upload to R2
+            # Upload to R2 using the property path
             if not self.r2_client.upload_file(request.local_output_file, request.r2_output_path):
                 request.error_details = f"Failed to upload to R2: {request.r2_output_path}"
                 return False
@@ -399,7 +432,7 @@ class SequentialQueueManager:
             
             self._update_status(request, RequestStatus.UPLOADING, "Upload completed", 95)
             
-            logger.info(f"Successfully uploaded result for {request.user_id}/{request.request_id}")
+            logger.info(f"Successfully uploaded result for {request.user_id}/{request.video_id}/{request.segment_id}")
             return True
             
         except Exception as e:
@@ -430,7 +463,7 @@ class SequentialQueueManager:
             request.progress = 100
             request.end_time = datetime.now().isoformat()
         
-        logger.info(f"Request {request.user_id}/{request.request_id} completed successfully")
+        logger.info(f"Request {request.user_id}/{request.video_id}/{request.segment_id} completed successfully")
     
     def _mark_failed(self, request: ProcessingRequest, status: RequestStatus, 
                     error_details: Optional[str] = None):
@@ -443,4 +476,4 @@ class SequentialQueueManager:
             if error_details:
                 request.error_details = error_details
         
-        logger.error(f"Request {request.user_id}/{request.request_id} failed: {status.value}")
+        logger.error(f"Request {request.user_id}/{request.video_id}/{request.segment_id} failed: {status.value}")

@@ -70,13 +70,11 @@ def initialize_services():
         
         # Initialize queue manager
         logger.info("Initializing queue manager...")
-        output_bucket = os.getenv('R2_OUTPUT_BUCKET', 'output-bucket')
         cleanup_after_processing = os.getenv('CLEANUP_WORKSPACE', 'true').lower() == 'true'
         
         queue_manager = SequentialQueueManager(
             r2_client=r2_client,
             workspace_manager=workspace_manager,
-            output_bucket=output_bucket,
             cleanup_after_processing=cleanup_after_processing
         )
         
@@ -96,21 +94,14 @@ def validate_request_data(data: Dict[str, Any]) -> Dict[str, Any]:
     errors = []
     
     # Required fields
-    required_fields = ['prompt', 'image_r2_path', 'audio_r2_path']
+    required_fields = ['bucket_name']
     for field in required_fields:
         if field not in data or not data[field]:
             errors.append(f"Missing required field: {field}")
     
-    # Validate prompt length
-    if 'prompt' in data and len(data['prompt']) > 1000:
-        errors.append("Prompt too long (max 1000 characters)")
-    
-    # Validate R2 paths
-    for path_field in ['image_r2_path', 'audio_r2_path']:
-        if path_field in data:
-            path = data[path_field]
-            if not (path.startswith('r2://') or '/' in path):
-                errors.append(f"Invalid R2 path format for {path_field}: {path}")
+    # Validate bucket name
+    if 'bucket_name' in data and len(data['bucket_name']) > 100:
+        errors.append("Bucket name too long (max 100 characters)")
     
     # Validate numeric parameters
     try:
@@ -180,26 +171,26 @@ def health_check():
         }), 500
 
 
-@app.route('/<user_id>/<request_id>', methods=['POST'])
-def submit_request(user_id: str, request_id: str):
+@app.route('/<user_id>/<video_id>/<segment_id>', methods=['POST'])
+def submit_request(user_id: str, video_id: str, segment_id: str):
     """Submit a new S2V processing request"""
     
     if not queue_manager:
         return jsonify({'error': 'Queue manager not initialized'}), 503
     
     try:
-        # Validate user_id and request_id
-        if not user_id or not request_id:
-            return jsonify({'error': 'Invalid user_id or request_id'}), 400
+        # Validate user_id, video_id and segment_id
+        if not user_id or not video_id or not segment_id:
+            return jsonify({'error': 'Invalid user_id, video_id, or segment_id'}), 400
         
-        if len(user_id) > 50 or len(request_id) > 50:
-            return jsonify({'error': 'user_id and request_id must be 50 characters or less'}), 400
+        if len(user_id) > 50 or len(video_id) > 50 or len(segment_id) > 50:
+            return jsonify({'error': 'user_id, video_id, and segment_id must be 50 characters or less'}), 400
         
         # Check if request already exists
-        existing_request = queue_manager.get_request_status(user_id, request_id)
+        existing_request = queue_manager.get_request_status(user_id, video_id, segment_id)
         if existing_request:
             return jsonify({
-                'error': f'Request {user_id}/{request_id} already exists',
+                'error': f'Request {user_id}/{video_id}/{segment_id} already exists',
                 'status': existing_request.status.value,
                 'existing_request': existing_request.to_dict()
             }), 409
@@ -221,14 +212,12 @@ def submit_request(user_id: str, request_id: str):
         # Create processing request
         processing_request = ProcessingRequest(
             user_id=user_id,
-            request_id=request_id,
-            prompt=validated_data['prompt'],
-            image_r2_path=validated_data['image_r2_path'],
-            audio_r2_path=validated_data['audio_r2_path'],
+            video_id=video_id,
+            segment_id=segment_id,
+            bucket_name=validated_data.get('bucket_name', 'dolphintest'),
             size=validated_data.get('size', '832*480'),
             sample_guide_scale=validated_data.get('sample_guide_scale', 4.0),
             sample_steps=validated_data.get('sample_steps', 20),
-            output_bucket=validated_data.get('output_bucket'),
             ckpt_dir=validated_data.get('ckpt_dir', './Wan2.2-S2V-14B/')
         )
         
@@ -240,22 +229,22 @@ def submit_request(user_id: str, request_id: str):
         queue_info = queue_manager.get_queue_info()
         
         return jsonify({
-            'message': f'Request {user_id}/{request_id} queued successfully',
+            'message': f'Request {user_id}/{video_id}/{segment_id} queued successfully',
             'status': 'queued',
             'queue_position': processing_request.queue_position,
             'estimated_wait_time_minutes': processing_request.queue_position * 5,  # Rough estimate
             'queue_size': queue_info['queue_size'],
-            'status_url': f'/{user_id}/{request_id}/status',
+            'status_url': f'/{user_id}/{video_id}/{segment_id}/status',
             'created_time': processing_request.created_time
         }), 202
         
     except Exception as e:
-        logger.error(f"Error submitting request {user_id}/{request_id}: {str(e)}")
+        logger.error(f"Error submitting request {user_id}/{video_id}/{segment_id}: {str(e)}")
         return jsonify({'error': f'Internal server error: {str(e)}'}), 500
 
 
-@app.route('/<user_id>/<request_id>/status', methods=['GET'])
-def get_request_status(user_id: str, request_id: str):
+@app.route('/<user_id>/<video_id>/<segment_id>/status', methods=['GET'])
+def get_request_status(user_id: str, video_id: str, segment_id: str):
     """Get the status of a processing request"""
     
     if not queue_manager:
@@ -263,10 +252,10 @@ def get_request_status(user_id: str, request_id: str):
     
     try:
         # Get request status
-        request_info = queue_manager.get_request_status(user_id, request_id)
+        request_info = queue_manager.get_request_status(user_id, video_id, segment_id)
         
         if not request_info:
-            return jsonify({'error': f'Request {user_id}/{request_id} not found'}), 404
+            return jsonify({'error': f'Request {user_id}/{video_id}/{segment_id} not found'}), 404
         
         # Convert to dictionary for response
         status_dict = request_info.to_dict()
@@ -283,12 +272,12 @@ def get_request_status(user_id: str, request_id: str):
         return jsonify(status_dict)
         
     except Exception as e:
-        logger.error(f"Error getting status for {user_id}/{request_id}: {str(e)}")
+        logger.error(f"Error getting status for {user_id}/{video_id}/{segment_id}: {str(e)}")
         return jsonify({'error': f'Internal server error: {str(e)}'}), 500
 
 
-@app.route('/<user_id>/<request_id>/result', methods=['GET'])
-def get_request_result(user_id: str, request_id: str):
+@app.route('/<user_id>/<video_id>/<segment_id>/result', methods=['GET'])
+def get_request_result(user_id: str, video_id: str, segment_id: str):
     """Get the result of a completed processing request"""
     
     if not queue_manager:
@@ -296,10 +285,10 @@ def get_request_result(user_id: str, request_id: str):
     
     try:
         # Get request status
-        request_info = queue_manager.get_request_status(user_id, request_id)
+        request_info = queue_manager.get_request_status(user_id, video_id, segment_id)
         
         if not request_info:
-            return jsonify({'error': f'Request {user_id}/{request_id} not found'}), 404
+            return jsonify({'error': f'Request {user_id}/{video_id}/{segment_id} not found'}), 404
         
         # Check if request is completed
         if request_info.status != RequestStatus.COMPLETED:
@@ -312,7 +301,8 @@ def get_request_result(user_id: str, request_id: str):
         # Return result information
         result = {
             'user_id': user_id,
-            'request_id': request_id,
+            'video_id': video_id,
+            'segment_id': segment_id,
             'status': 'completed',
             'r2_output_path': request_info.r2_output_path,
             'public_url': request_info.public_url,
@@ -331,7 +321,7 @@ def get_request_result(user_id: str, request_id: str):
         return jsonify(result)
         
     except Exception as e:
-        logger.error(f"Error getting result for {user_id}/{request_id}: {str(e)}")
+        logger.error(f"Error getting result for {user_id}/{video_id}/{segment_id}: {str(e)}")
         return jsonify({'error': f'Internal server error: {str(e)}'}), 500
 
 
